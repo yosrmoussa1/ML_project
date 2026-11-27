@@ -3,12 +3,13 @@ pipeline_prefect.py
 -------------------
 Orchestration du pipeline ML avec Prefect (tasks + flows).
 
-Flows : all, train, evaluate, predict, code, install, fetch
+Flows : all, train, evaluate, predict, code, install, fetch, api
 Lancement :
     python pipeline_prefect.py --flow all
     python pipeline_prefect.py --flow train        (alias : entrainement)
     python pipeline_prefect.py --flow evaluate
     python pipeline_prefect.py --flow code
+    python pipeline_prefect.py --flow api          (lance l'API FastAPI)
 """
 
 import argparse
@@ -81,6 +82,11 @@ def predict_task(model, X_test, y_test):
     return steps.run_predict(model, X_test, y_test)
 
 
+@task(name="Lancer l'API FastAPI")
+def api_task(model_path, host, port):
+    steps.run_api(model_path, host, port)
+
+
 # --------------------------------------------------------------------------- #
 # FLOWS
 # --------------------------------------------------------------------------- #
@@ -138,6 +144,14 @@ def predict_flow(data_path: str = "adult.zip", model_path: str = "model.joblib")
     return predict_task(model, X_test, y_test)
 
 
+@flow(name="api")
+def api_flow(
+    model_path: str = "model.joblib", host: str = "127.0.0.1", port: int = 8000
+):
+    """Lancement de l'API FastAPI (documentation sur /docs)."""
+    api_task(model_path, host, port)
+
+
 @flow(name="all")
 def all_flow(
     data_path: str = "adult.zip",
@@ -184,6 +198,7 @@ def parse_args():
             "code",
             "install",
             "fetch",
+            "api",
         ],
         help="Flow à exécuter",
     )
@@ -192,6 +207,8 @@ def parse_args():
     p.add_argument("--model-type", choices=["gb", "knn"], default="gb")
     p.add_argument("--skip-install", action="store_true")
     p.add_argument("--repo-url", default=None, help="URL du dépôt Git distant")
+    p.add_argument("--host", default="127.0.0.1", help="Hôte de l'API (flow api)")
+    p.add_argument("--port", type=int, default=8000, help="Port de l'API (flow api)")
     return p.parse_args()
 
 
@@ -217,6 +234,8 @@ def main():
         install_flow()
     elif a.flow == "fetch":
         fetch_flow(a.repo_url)
+    elif a.flow == "api":
+        api_flow(a.model, a.host, a.port)
 
 
 if __name__ == "__main__":

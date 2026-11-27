@@ -12,7 +12,6 @@ import os
 import zipfile
 
 import joblib
-
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import (
@@ -64,6 +63,23 @@ COLS_A_NORMALISER = [
     "capital_gain",
     "capital_loss",
     "hours_per_week",
+]
+AGE_BINS = [0, 25, 35, 45, 55, 65, 120]
+AGE_LABELS = ["<=25", "26-35", "36-45", "46-55", "56-65", "65+"]
+# Variables brutes attendues par l'API (avant encodage), cf. adult.data
+INPUT_COLUMNS = [
+    "age",
+    "workclass",
+    "education_num",
+    "marital_status",
+    "occupation",
+    "relationship",
+    "race",
+    "sex",
+    "capital_gain",
+    "capital_loss",
+    "hours_per_week",
+    "native_country",
 ]
 
 
@@ -133,8 +149,8 @@ def clean_data(df):
     # Feature engineering
     df["age_group"] = pd.cut(
         df["age"],
-        bins=[0, 25, 35, 45, 55, 65, 120],
-        labels=["<=25", "26-35", "36-45", "46-55", "56-65", "65+"],
+        bins=AGE_BINS,
+        labels=AGE_LABELS,
     )
     df["is_us"] = (df["native_country"] == "United-States").astype(int)
     df = df.drop(columns=["native_country"])
@@ -188,6 +204,9 @@ def prepare_data(
     )
 
     scaler = StandardScaler()
+    # Plafond appliqué à capital_gain pendant le nettoyage : il est sauvegardé
+    # avec le scaler pour que l'API reproduise exactement le même prétraitement.
+    scaler.capital_gain_cap_ = float(df["capital_gain"].max())
     X_train = X_train.copy()
     X_test = X_test.copy()
     X_train[COLS_A_NORMALISER] = scaler.fit_transform(X_train[COLS_A_NORMALISER])
@@ -199,6 +218,32 @@ def prepare_data(
 # --------------------------------------------------------------------------- #
 # 2) Entraînement
 # --------------------------------------------------------------------------- #
+def retrain(
+    data_path="adult.zip",
+    model_path="model.joblib",
+    model_type="gb",
+    hyperparams=None,
+):
+    """
+    Réentraîne le modèle avec de nouveaux hyperparamètres, l'évalue puis
+    remplace le modèle et le scaler sauvegardés.
+
+    Args:
+        data_path (str): données d'entraînement (cf. prepare_data).
+        model_path (str): chemin du modèle à écraser.
+        model_type (str): 'gb' ou 'knn'.
+        hyperparams (dict|None): hyperparamètres du modèle.
+
+    Returns:
+        tuple: (model, scaler, metrics) avec metrics = dict de evaluate_model().
+    """
+    X_train, X_test, y_train, y_test, scaler = prepare_data(data_path)
+    model = train_model(X_train, y_train, model_type, **(hyperparams or {}))
+    metrics = evaluate_model(model, X_test, y_test, name="Modèle réentraîné")
+    save_model(model, model_path, scaler=scaler)
+    return model, scaler, {k: float(v) for k, v in metrics.items()}
+
+
 def find_best_k(X_train, y_train, k_max=15, cv_splits=5, random_state=RANDOM_STATE):
     """
     Choisit k (KNN) par validation croisée sur le TRAIN (et non sur le test,
@@ -221,7 +266,12 @@ def find_best_k(X_train, y_train, k_max=15, cv_splits=5, random_state=RANDOM_STA
 
 
 def train_model(
-    X_train, y_train, model_type="gb", n_neighbors=12, random_state=RANDOM_STATE
+    X_train,
+    y_train,
+    model_type="gb",
+    n_neighbors=12,
+    random_state=RANDOM_STATE,
+    **hyperparams,
 ):
     """
     Entraîne un modèle.
@@ -229,6 +279,8 @@ def train_model(
     Args:
         model_type (str): 'gb' (Gradient Boosting) ou 'knn'.
         n_neighbors (int): k pour le KNN (12 = valeur retenue dans le notebook).
+        **hyperparams: hyperparamètres supplémentaires transmis au modèle
+            (ex. n_estimators, learning_rate, max_depth pour 'gb').
 
     Returns:
         modèle scikit-learn entraîné.
@@ -237,9 +289,9 @@ def train_model(
         raise ValueError("X_train et y_train n'ont pas la même taille.")
 
     if model_type == "gb":
-        model = GradientBoostingClassifier(random_state=random_state)
+        model = GradientBoostingClassifier(random_state=random_state, **hyperparams)
     elif model_type == "knn":
-        model = KNeighborsClassifier(n_neighbors=n_neighbors)
+        model = KNeighborsClassifier(n_neighbors=n_neighbors, **hyperparams)
     else:
         raise ValueError("model_type doit être 'gb' ou 'knn'.")
 
@@ -295,25 +347,8 @@ def feature_importance(model, feature_names, top=15):
 
 
 # --------------------------------------------------------------------------- #
-# 4) Sauvegarde / chargement
+# 4) Prédiction
 # --------------------------------------------------------------------------- #
-def save_model(model, path="model.joblib", scaler=None):
-    """Sauvegarde le modèle (et optionnellement le scaler) avec joblib."""
-    joblib.dump(model, path)
-    print(f"Modèle sauvegardé : {path}")
-    if scaler is not None:
-        scaler_path = os.path.splitext(path)[0] + "_scaler.joblib"
-        joblib.dump(scaler, scaler_path)
-        print(f"Scaler sauvegardé : {scaler_path}")
-
-
-def load_model(path="model.joblib"):
-    """Charge un modèle sauvegardé avec joblib."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Modèle introuvable : {path}")
-    return joblib.load(path)
-
-
 def predict_model(model, X):
     """
     Prédit la classe de revenu pour de nouvelles observations.
@@ -336,3 +371,71 @@ def predict_model(model, X):
         },
         index=X.index,
     )
+
+
+def encode_raw_input(records, feature_columns, scaler):
+    """
+    Transforme des observations BRUTES (ex. JSON reçu par l'API) en variables
+    prêtes pour le modèle, en reproduisant clean_data() + la normalisation.
+
+    Args:
+        records (dict | list[dict]): une ou plusieurs observations contenant
+            les clés de INPUT_COLUMNS.
+        feature_columns (list[str]): colonnes vues à l'entraînement
+            (ex. model.feature_names_in_).
+        scaler (StandardScaler): scaler ajusté lors de prepare_data().
+
+    Returns:
+        pd.DataFrame: observations encodées, colonnes dans l'ordre attendu.
+    """
+    if isinstance(records, dict):
+        records = [records]
+    raw = pd.DataFrame(records)
+    manquantes = [c for c in INPUT_COLUMNS if c not in raw.columns]
+    if manquantes:
+        raise ValueError(f"Variables manquantes : {manquantes}")
+
+    X = pd.DataFrame(0.0, index=raw.index, columns=list(feature_columns))
+
+    # Variables numériques + indicateurs (calculés AVANT le plafonnement)
+    capital_gain = raw["capital_gain"].astype(float)
+    cap = getattr(scaler, "capital_gain_cap_", None)
+    X["has_capital_gain"] = (capital_gain > 0).astype(float)
+    X["has_capital_loss"] = (raw["capital_loss"] > 0).astype(float)
+    X["capital_gain"] = capital_gain if cap is None else capital_gain.clip(upper=cap)
+    for col in ("age", "education_num", "capital_loss", "hours_per_week"):
+        X[col] = raw[col].astype(float)
+    X["is_us"] = (raw["native_country"] == "United-States").astype(float)
+
+    # Variables catégorielles -> colonnes one-hot (la modalité de référence,
+    # supprimée par drop_first, correspond à toutes les colonnes à 0)
+    cat = raw.copy()
+    cat["age_group"] = pd.cut(cat["age"], bins=AGE_BINS, labels=AGE_LABELS).astype(str)
+    for col in COLS_A_ENCODER:
+        for idx, val in cat[col].items():
+            nom = f"{col}_{val}"
+            if nom in X.columns:
+                X.loc[idx, nom] = 1.0
+
+    X[COLS_A_NORMALISER] = scaler.transform(X[COLS_A_NORMALISER])
+    return X
+
+
+# --------------------------------------------------------------------------- #
+# 5) Sauvegarde / chargement
+# --------------------------------------------------------------------------- #
+def save_model(model, path="model.joblib", scaler=None):
+    """Sauvegarde le modèle (et optionnellement le scaler) avec joblib."""
+    joblib.dump(model, path)
+    print(f"Modèle sauvegardé : {path}")
+    if scaler is not None:
+        scaler_path = os.path.splitext(path)[0] + "_scaler.joblib"
+        joblib.dump(scaler, scaler_path)
+        print(f"Scaler sauvegardé : {scaler_path}")
+
+
+def load_model(path="model.joblib"):
+    """Charge un modèle sauvegardé avec joblib."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Modèle introuvable : {path}")
+    return joblib.load(path)

@@ -11,6 +11,7 @@ Exemples CLI :
     python main.py --evaluate
     python main.py --predict
     python main.py --all
+    python main.py --api            (lance l'API FastAPI sur le port 8000)
 """
 
 import argparse
@@ -32,8 +33,8 @@ from model_pipeline import (
 )
 
 # Seuls ces fichiers sont analysés (qualité / sécurité) : plus rapide
-PROJECT_FILES = ["model_pipeline.py", "main.py", "pipeline_prefect.py"]
-TEST_FILE = "test_model_pipeline.py"
+PROJECT_FILES = ["model_pipeline.py", "main.py", "pipeline_prefect.py", "app.py"]
+TEST_FILES = ["test_model_pipeline.py", "test_app.py"]
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +81,7 @@ def install_dependencies(requirements="requirements.txt"):
 
 def format_code():
     """Formate le code avec black (uniquement les fichiers du projet)."""
-    run_command([sys.executable, "-m", "black", *PROJECT_FILES, TEST_FILE])
+    run_command([sys.executable, "-m", "black", *PROJECT_FILES, *TEST_FILES])
 
 
 def check_quality():
@@ -92,7 +93,7 @@ def check_quality():
             "flake8",
             "--max-line-length=88",
             *PROJECT_FILES,
-            TEST_FILE,
+            *TEST_FILES,
         ]
     )
 
@@ -104,7 +105,7 @@ def check_security():
 
 def run_unit_tests():
     """Exécute les tests unitaires avec pytest."""
-    run_command([sys.executable, "-m", "pytest", "-q", TEST_FILE])
+    run_command([sys.executable, "-m", "pytest", "-q", *TEST_FILES])
 
 
 # --------------------------------------------------------------------------- #
@@ -161,6 +162,31 @@ def run_predict(model, X_test, y_test=None, n=5):
     return result
 
 
+def run_api(model_path="model.joblib", host="127.0.0.1", port=8000):
+    """
+    Lance l'API FastAPI (app.py) avec uvicorn. Bloque jusqu'à Ctrl+C.
+    Le modèle est lu via la variable d'environnement MODEL_PATH.
+    Utiliser host="0.0.0.0" pour l'exposer sur le réseau.
+    """
+    if not os.path.exists(model_path):
+        print(f"[ATTENTION] {model_path} introuvable : /predict répondra 503.")
+        print("Entraînez d'abord le modèle : python pipeline_prefect.py --flow train")
+    os.environ["MODEL_PATH"] = model_path
+    print(f"API sur http://{host}:{port}  (documentation : /docs)")
+    run_command(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app:app",
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+    )
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -181,11 +207,17 @@ def parse_args():
     p.add_argument("--predict", action="store_true", help="Prédire sur le test")
     p.add_argument("--save", action="store_true", help="Sauvegarder le modèle")
     p.add_argument("--all", action="store_true", help="Tout le pipeline")
+    p.add_argument("--api", action="store_true", help="Lancer l'API FastAPI")
+    p.add_argument("--host", default="127.0.0.1", help="Hôte de l'API")
+    p.add_argument("--port", type=int, default=8000, help="Port de l'API")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.api:
+        run_api(args.model, args.host, args.port)
+        return
     actions = [args.prepare, args.train, args.evaluate, args.predict, args.save]
     if not any(actions + [args.all]):
         print("Aucune action demandée. Utilisez --help.")
